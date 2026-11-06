@@ -90,7 +90,8 @@ local HS = game:GetService("HttpService")
 --  RoClothes Remake v.0.8.0 by Cheswer  |  modulo agregado (NPCs / Pose / Anim / Scene)
 --  Se agrega como 4 pestanas nuevas a la GUI original de RoClothes.
 -- ================================================================
-function RoClothesRemakePatch(Player, GUIObject)
+function RoClothesRemakePatch(Player, GUIObject, Hooks)
+	Hooks = Hooks or {}
 	local Players = game:GetService("Players")
 	local RunService = game:GetService("RunService")
 	local UIS = game:GetService("UserInputService")
@@ -508,6 +509,7 @@ function RoClothesRemakePatch(Player, GUIObject)
 	NPCs.List = {}
 	NPCs.Order = {}
 	NPCs.ShowNames = false
+	NPCs.UseConfig = true
 
 	function Targets.Resolve(str)
 		str = U.trim(str)
@@ -652,6 +654,30 @@ function RoClothesRemakePatch(Player, GUIObject)
 		return NPCs.List[name]
 	end
 
+	function NPCs.Spawn(model, name, source)
+		local d = NPCs.Register(model, name)
+		d.Source = source
+		if NPCs.UseConfig and Hooks.Apply then
+			local ok, err = pcall(Hooks.Apply, d.Model)
+			if ok then
+				d.Rig:Scan()
+			else
+				App.Notify("NPC created, but your RoClothes config failed: " .. tostring(err), "err")
+			end
+		end
+		return d
+	end
+
+	-- avatar limpio (R6, como usa RoClothes) a partir de un UserId: sin las partes que RoClothes agrega al personaje en juego
+	function NPCs.FromUserId(userId, name)
+		local ok, desc = pcall(Players.GetHumanoidDescriptionFromUserId, Players, userId)
+		if not ok or not desc then return nil, "could not read that avatar" end
+		local ok2, model = pcall(Players.CreateHumanoidModelFromDescription, Players, desc, Enum.HumanoidRigType.R6)
+		if not ok2 or not model then return nil, "could not build the avatar (executor restriction)" end
+		return NPCs.Spawn(model, name, { uid = userId })
+	end
+
+	-- plan B: copia del personaje en juego, quitando todo lo que RoClothes le agrego
 	function NPCs.CloneModel(source, name)
 		local ok, clone = pcall(function()
 			source.Archivable = true
@@ -661,31 +687,33 @@ function RoClothesRemakePatch(Player, GUIObject)
 			return source:Clone()
 		end)
 		if not ok or not clone then return nil, "could not clone that character" end
-		return NPCs.Register(clone, name)
+		for _, d in ipairs(clone:GetDescendants()) do
+			if d:HasTag("RoClothes") then d:Destroy() end
+		end
+		for _, n in ipairs({ "Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }) do
+			local p = clone:FindFirstChild(n)
+			if p and p:IsA("BasePart") then p.Transparency = 0 end
+		end
+		return NPCs.Spawn(clone, name, { clone = true })
 	end
 
 	function NPCs.FromUser(username, name)
 		local ok, id = pcall(Players.GetUserIdFromNameAsync, Players, username)
 		if not ok or not id then return nil, "user '" .. username .. "' not found" end
-		local ok2, desc = pcall(Players.GetHumanoidDescriptionFromUserId, Players, id)
-		if not ok2 or not desc then return nil, "could not read that avatar" end
-		local ok3, model = pcall(Players.CreateHumanoidModelFromDescription, Players, desc, Enum.HumanoidRigType.R15)
-		if not ok3 or not model then return nil, "could not build that avatar (executor restriction)" end
-		return NPCs.Register(model, name)
+		return NPCs.FromUserId(id, name)
 	end
 
 	function NPCs.Blank(name)
-		local ok, model = pcall(Players.CreateHumanoidModelFromDescription, Players, Instance.new("HumanoidDescription"), Enum.HumanoidRigType.R15)
-		if not ok or not model then
-			return nil, "could not build a blank rig, clone an avatar instead"
-		end
-		return NPCs.Register(model, name)
+		local ok, model = pcall(Players.CreateHumanoidModelFromDescription, Players, Instance.new("HumanoidDescription"), Enum.HumanoidRigType.R6)
+		if not ok or not model then return nil, "could not build a blank rig, clone an avatar instead" end
+		return NPCs.Spawn(model, name, { blank = true })
 	end
 
 	function NPCs.Delete(name)
 		local d = NPCs.Find(name)
 		if not d then return false end
 		App.Fire("npcremoved", d.Model)
+		if Hooks.Remove then pcall(Hooks.Remove, d.Model) end
 		pcall(function() d.Model:Destroy() end)
 		NPCs.List[d.Name] = nil
 		for i, n in ipairs(NPCs.Order) do
@@ -1037,16 +1065,24 @@ function RoClothesRemakePatch(Player, GUIObject)
 
 	---------------------------------------------------------------- TAB: NPCs
 	function NPCs.Duplicate(model)
-		local rig = Rig.Get(model)
-		local pose = rig and rig:Capture()
-		if rig then rig:Reset() end
-		local d, err = NPCs.CloneModel(model, model.Name .. "_copy")
-		if rig and pose then
-			rig:SetPose(pose)
-			if d then
-				d.Rig:SetPose(pose)
-				d.Model:PivotTo(model:GetPivot() * CFrame.new(4, 0, 0))
-			end
+		local src = NPCs.Find(model.Name)
+		if not src then return nil, "not an NPC" end
+		local pose = src.Rig:Capture()
+		local s = src.Source or {}
+		local name = model.Name .. "_copy"
+		local d, err
+		if s.uid then
+			d, err = NPCs.FromUserId(s.uid, name)
+		elseif s.blank then
+			d, err = NPCs.Blank(name)
+		else
+			src.Rig:Reset()
+			d, err = NPCs.CloneModel(model, name)
+			src.Rig:SetPose(pose)
+		end
+		if d then
+			d.Rig:SetPose(pose)
+			d.Model:PivotTo(src.Model:GetPivot() * CFrame.new(4, 0, 0))
 		end
 		return d, err
 	end
@@ -1070,25 +1106,30 @@ function RoClothesRemakePatch(Player, GUIObject)
 		UI.Button(r2, "Clone avatar", "teal", function()
 			local src = U.trim(srcBox.Text)
 			local l = src:lower()
-			local model, defName
+			local model, defName, uid
 			if src == "" or l == "self" then
-				model, defName = LP.Character, LP.Name
+				model, defName, uid = LP.Character, LP.Name, LP.UserId
 			else
 				local npc = NPCs.Find(src)
 				if npc then
 					model, defName = npc.Model, npc.Name
+					uid = npc.Source and npc.Source.uid
 				else
 					local p = Targets.FindPlayer(src)
-					if p then model, defName = p.Character, p.Name end
+					if p then model, defName, uid = p.Character, p.Name, p.UserId end
 				end
 			end
 			local name = U.trim(nameBox.Text)
+			if name == "" then name = defName or src end
 			local d, err
-			if model then
-				d, err = NPCs.CloneModel(model, name ~= "" and name or defName)
+			if uid then
+				d, err = NPCs.FromUserId(uid, name)
+				if not d and model then d, err = NPCs.CloneModel(model, name) end
+			elseif model then
+				d, err = NPCs.CloneModel(model, name)
 			else
 				App.Notify("Looking up Roblox user '" .. src .. "'...")
-				d, err = NPCs.FromUser(src, name ~= "" and name or src)
+				d, err = NPCs.FromUser(src, name)
 			end
 			if d then
 				App.SetTarget(d.Name)
@@ -1097,7 +1138,7 @@ function RoClothesRemakePatch(Player, GUIObject)
 				App.Notify(err or "failed", "err")
 			end
 		end, 0.5)
-		UI.Button(r2, "Blank R15", "blue", function()
+		UI.Button(r2, "Blank R6", "blue", function()
 			local name = U.trim(nameBox.Text)
 			local d, err = NPCs.Blank(name ~= "" and name or "Dummy")
 			if d then
@@ -1107,6 +1148,19 @@ function RoClothesRemakePatch(Player, GUIObject)
 				App.Notify(err or "failed", "err")
 			end
 		end, 0.5)
+		if Hooks.Apply then
+			UI.Toggle(page, "Use my RoClothes config", true, function(v) NPCs.UseConfig = v end)
+			UI.Button(page, "Re-apply config to Target NPCs", "purple", function()
+				local list = Targets.NPCModels()
+				if #list == 0 then App.Notify("Target has no NPCs", "err") return end
+				for _, mdl in ipairs(list) do
+					Hooks.Apply(mdl)
+					local rg = Rig.Get(mdl)
+					if rg then rg:Scan() end
+				end
+				App.Notify("Config applied to " .. #list .. " NPC(s)", "ok")
+			end)
+		end
 
 		UI.Section(page, "NPC list (tap to select)", "teal")
 		local list = UI.List(page, 84, function(name) App.SetTarget(name) end, 2)
@@ -25980,7 +26034,46 @@ function RoClothes(Player)
 	end
 
 	do -- Remake v.0.8.0: agrega las pestanas NPCs / Pose / Anim / Scene antes de conectar los botones
-		local okRCP, resRCP = pcall(RoClothesRemakePatch, Player, GUIObject)
+		-- Los NPCs nuevos usan el mismo proceso que el click-execute original: copian la config
+		-- de SelectPlayer (Self por defecto) y pasan por Function.CharacterExecute.
+		local function rcDeepClone(t, seen)
+			if type(t) ~= "table" then return t end
+			seen = seen or {}
+			if seen[t] then return seen[t] end
+			local c = {}
+			seen[t] = c
+			for k, v in pairs(t) do
+				c[k] = rcDeepClone(v, seen)
+			end
+			return c
+		end
+		local RCHooks = {}
+		function RCHooks.Apply(model)
+			local src = PlayerData[SelectPlayer] or PlayerData[Player.Name]
+			if not src then return end
+			local key = Function.TableFind(NPCs, model)
+			if not key then
+				key = math.random(0, 999999999) .. model.Name
+				NPCs[key] = model
+			end
+			Function.CharacterReset(model)
+			local data = rcDeepClone(src)
+			data.CurrentPartList = Function.PlayerDataDefault().CurrentPartList
+			data.Character = nil
+			data.Cooldown = false
+			PlayerData[key] = data
+			Function.CharacterExecute(model, key)
+		end
+		function RCHooks.Remove(model)
+			local key = Function.TableFind(NPCs, model)
+			if not key then return end
+			pcall(Function.CharacterReset, model, true)
+			NPCs[key] = nil
+			PlayerData[key] = nil
+			local f = Method2CharacterFolder and Method2CharacterFolder:FindFirstChild(key)
+			if f then f:Destroy() end
+		end
+		local okRCP, resRCP = pcall(RoClothesRemakePatch, Player, GUIObject, RCHooks)
 		if okRCP then
 			RCP = resRCP
 		else
